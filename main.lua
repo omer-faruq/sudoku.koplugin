@@ -64,6 +64,20 @@ local function emptyNotes()
     return notes
 end
 
+local function cloneNoteCell(cell)
+    if not cell then
+        return nil
+    end
+    local copy = nil
+    for digit = 1, 9 do
+        if cell[digit] then
+            copy = copy or {}
+            copy[digit] = true
+        end
+    end
+    return copy
+end
+
 local function copyNotes(src)
     local notes = {}
     for r = 1, 9 do
@@ -225,6 +239,7 @@ function SudokuBoard:new()
         selected = { row = 1, col = 1 },
         difficulty = DEFAULT_DIFFICULTY,
         reveal_solution = false,
+        undo_stack = {},
     }
     setmetatable(board, self)
     board:recalcConflicts()
@@ -252,6 +267,7 @@ function SudokuBoard:load(state)
     self.user = copyGrid(state.user)
     self.notes = copyNotes(state.notes)
     self.difficulty = state.difficulty or DEFAULT_DIFFICULTY
+    self.undo_stack = {}
     if state.selected then
         self.selected = {
             row = math.max(1, math.min(9, state.selected.row or 1)),
@@ -275,7 +291,18 @@ function SudokuBoard:generate(difficulty)
     self.notes = emptyNotes()
     self.selected = { row = 1, col = 1 }
     self.reveal_solution = false
+    self.undo_stack = {}
     self:recalcConflicts()
+end
+
+function SudokuBoard:pushUndo(entry)
+    if entry then
+        self.undo_stack[#self.undo_stack + 1] = entry
+    end
+end
+
+function SudokuBoard:clearUndoHistory()
+    self.undo_stack = {}
 end
 
 function SudokuBoard:getWorkingValue(row, col)
@@ -375,11 +402,29 @@ function SudokuBoard:setValue(value)
     if self:isGiven(row, col) then
         return false, _("This cell is fixed.")
     end
-    self.user[row][col] = value or 0
-    if value then
-        self:clearNotes(row, col)
+    local prev_value = self.user[row][col]
+    local prev_notes = cloneNoteCell(self.notes[row][col])
+    local new_value = value or 0
+
+    if prev_value == new_value and not prev_notes then
+        if not value then
+            return false, _("Cell already empty.")
+        end
+        return true
     end
+
+    self.user[row][col] = new_value
+    self:clearNotes(row, col)
     self:recalcConflicts()
+    if prev_value ~= new_value or prev_notes then
+        self:pushUndo{
+            type = "value",
+            row = row,
+            col = col,
+            prev_value = prev_value,
+            prev_notes = prev_notes,
+        }
+    end
     return true
 end
 
@@ -436,7 +481,19 @@ function SudokuBoard:toggleNoteDigit(value)
         return false, _("Clear the cell before adding notes.")
     end
     self.notes[row][col] = self.notes[row][col] or {}
-    self.notes[row][col][value] = not self.notes[row][col][value] and true or nil
+    local prev_cell = cloneNoteCell(self.notes[row][col])
+    local was_set = self.notes[row][col][value] and true or false
+    self.notes[row][col][value] = was_set and nil or true
+    local now_set = self.notes[row][col][value] and true or false
+    if was_set == now_set then
+        return true
+    end
+    self:pushUndo{
+        type = "notes",
+        row = row,
+        col = col,
+        prev_notes = prev_cell,
+    }
     return true
 end
 
@@ -450,6 +507,28 @@ function SudokuBoard:getRemainingCells()
         end
     end
     return remaining
+end
+
+function SudokuBoard:canUndo()
+    return self.undo_stack[1] ~= nil
+end
+
+function SudokuBoard:undo()
+    local entry = table.remove(self.undo_stack)
+    if not entry then
+        return false, _("Nothing to undo.")
+    end
+    local row, col = entry.row, entry.col
+    if entry.type == "value" then
+        self.user[row][col] = entry.prev_value or 0
+        self.notes[row][col] = cloneNoteCell(entry.prev_notes) or {}
+        self:setSelection(row, col)
+        self:recalcConflicts()
+    elseif entry.type == "notes" then
+        self.notes[row][col] = cloneNoteCell(entry.prev_notes) or {}
+        self:setSelection(row, col)
+    end
+    return true
 end
 
 function SudokuBoard:isSolved()
@@ -609,6 +688,7 @@ function SudokuScreen:init()
     self.covers_fullscreen = true
     self.vertical_align = "center"
     self.note_mode = false
+    self.undo_button = nil
     if Device:hasKeys() then
         self.key_events.Close = { { Device.input.group.Back } }
     end
@@ -722,6 +802,13 @@ function SudokuScreen:buildLayout()
                 self:checkProgress()
             end,
         },
+        {
+            id = "undo_button",
+            text = _("Undo"),
+            callback = function()
+                self:onUndo()
+            end,
+        },
     }
     local keypad = ButtonTable:new{
         width = math.floor(Screen:getWidth() * 0.75),
@@ -729,6 +816,7 @@ function SudokuScreen:buildLayout()
         buttons = keypad_rows,
     }
     self.note_button = keypad:getButtonById("note_button")
+    self.undo_button = keypad:getButtonById("undo_button")
     self.layout = VerticalGroup:new{
         align = "center",
         VerticalSpan:new{ width = Size.span.vertical_large },
@@ -744,6 +832,7 @@ function SudokuScreen:buildLayout()
     self[1] = self.layout
     self:ensureShowButtonState()
     self:updateNoteButton()
+    self:updateUndoButton()
     self:updateDifficultyButton()
     self:updateStatus()
 end
@@ -758,6 +847,13 @@ function SudokuScreen:updateNoteButton()
     end
     local width = self.note_button.width
     self.note_button:setText(self:getNoteButtonText(), width)
+end
+
+function SudokuScreen:updateUndoButton()
+    if not self.undo_button then
+        return
+    end
+    self.undo_button:enableDisable(self.board:canUndo())
 end
 
 function SudokuScreen:toggleNoteMode()
@@ -852,6 +948,7 @@ function SudokuScreen:onDigit(value)
         self.board_widget:refresh()
         self:updateStatus()
         self.plugin:saveState()
+        self:updateUndoButton()
         return
     end
     local ok, err = self.board:setValue(value)
@@ -862,6 +959,7 @@ function SudokuScreen:onDigit(value)
     self.board_widget:refresh()
     self:updateStatus()
     self.plugin:saveState()
+    self:updateUndoButton()
     if self.board:isSolved() then
         UIManager:show(InfoMessage:new{ text = _("Puzzle complete!"), timeout = 4 })
     end
@@ -878,6 +976,7 @@ function SudokuScreen:onErase()
     self.board_widget:refresh()
     self:updateStatus()
     self.plugin:saveState()
+    self:updateUndoButton()
 end
 
 function SudokuScreen:onNewGame()
@@ -885,6 +984,7 @@ function SudokuScreen:onNewGame()
     self.plugin:saveState()
     self.board_widget:refresh()
     self:ensureShowButtonState()
+    self:updateUndoButton()
     self:updateStatus(_("Started a new game."))
 end
 
@@ -918,6 +1018,18 @@ end
 function SudokuScreen:onClose()
     self.plugin:saveState()
     self.plugin:onScreenClosed()
+end
+
+function SudokuScreen:onUndo()
+    local ok, err = self.board:undo()
+    if not ok then
+        self:updateStatus(err)
+        return
+    end
+    self.board_widget:refresh()
+    self:updateStatus(_("Last move undone."))
+    self.plugin:saveState()
+    self:updateUndoButton()
 end
 
 local Sudoku = WidgetContainer:extend{
