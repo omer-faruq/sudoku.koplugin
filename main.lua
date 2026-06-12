@@ -1,4 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local ButtonTable = require("ui/widget/buttontable")
 local DataStorage = require("datastorage")
 local Device = require("device")
@@ -17,6 +18,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Font = require("ui/font")
+local SudokuGrid = require("sudoku_grid")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -268,6 +270,7 @@ function SudokuBoard:serialize()
         selected = { row = self.selected.row, col = self.selected.col },
         difficulty = self.difficulty,
         reveal_solution = self.reveal_solution,
+        source_label = self.source_label,
     }
 end
 
@@ -295,6 +298,7 @@ function SudokuBoard:load(state)
         self.selected = { row = 1, col = 1 }
     end
     self.reveal_solution = state.reveal_solution or false
+    self.source_label = state.source_label
     self:recalcConflicts()
     return true
 end
@@ -310,8 +314,42 @@ function SudokuBoard:generate(difficulty)
     self.wrong_marks = emptyMarkerGrid()
     self.selected = { row = 1, col = 1 }
     self.reveal_solution = false
+    self.source_label = nil
     self.undo_stack = {}
     self:recalcConflicts()
+end
+
+-- Load an externally supplied puzzle (e.g. from a puzzle bank). When no valid
+-- solution is supplied it is computed by solving the puzzle. Returns ok, err.
+function SudokuBoard:loadPuzzle(puzzle_grid, opts)
+    opts = opts or {}
+    if not SudokuGrid.isValidGrid(puzzle_grid) then
+        return false, _("This puzzle could not be read.")
+    end
+    local solution = opts.solution
+    if solution and not SudokuGrid.isSolutionOf(puzzle_grid, solution) then
+        solution = nil
+    end
+    if not solution then
+        solution = SudokuGrid.solve(puzzle_grid)
+    end
+    if not solution then
+        return false, _("This puzzle has no solution and was skipped.")
+    end
+    self.puzzle = copyGrid(puzzle_grid)
+    self.solution = copyGrid(solution)
+    self.user = emptyGrid()
+    self.notes = emptyNotes()
+    self.wrong_marks = emptyMarkerGrid()
+    self.selected = { row = 1, col = 1 }
+    self.reveal_solution = false
+    self.source_label = opts.label
+    if opts.difficulty then
+        self.difficulty = opts.difficulty
+    end
+    self.undo_stack = {}
+    self:recalcConflicts()
+    return true
 end
 
 function SudokuBoard:pushUndo(entry)
@@ -861,14 +899,7 @@ function SudokuScreen:buildLayout()
                 {
                     text = _("New game"),
                     callback = function()
-                        self:onNewGame()
-                    end,
-                },
-                {
-                    id = "difficulty_button",
-                    text = self:getDifficultyButtonText(),
-                    callback = function()
-                        self:openDifficultyMenu()
+                        self:onNewGamePressed()
                     end,
                 },
                 {
@@ -890,7 +921,6 @@ function SudokuScreen:buildLayout()
         },
     }
     self.show_result_button = top_buttons:getButtonById("show_result")
-    self.difficulty_button = top_buttons:getButtonById("difficulty_button")
 
     local keypad_rows = {}
     local value = 1
@@ -959,7 +989,6 @@ function SudokuScreen:buildLayout()
     self:ensureShowButtonState()
     self:updateNoteButton()
     self:updateUndoButton()
-    self:updateDifficultyButton()
     self:updateStatus()
 end
 
@@ -988,58 +1017,36 @@ function SudokuScreen:toggleNoteMode()
     self:updateStatus(self.note_mode and _("Note mode enabled.") or _("Note mode disabled."))
 end
 
-function SudokuScreen:getDifficultyButtonText()
-    local label = DIFFICULTY_LABELS[self.board.difficulty] or self.board.difficulty
-    return T(_("Difficulty: %1"), label)
-end
-
-function SudokuScreen:updateDifficultyButton()
-    if not self.difficulty_button then
-        return
-    end
-    local width = self.difficulty_button.width
-    self.difficulty_button:setText(self:getDifficultyButtonText(), width)
-end
-
-function SudokuScreen:openDifficultyMenu()
-    local menu
-    local function selectDifficulty(level)
-        if level ~= self.board.difficulty then
-            self.board:generate(level)
-            self.plugin:saveState()
-            self.board_widget:refresh()
-            self:ensureShowButtonState()
-            self:updateStatus(T(_("Started a %1 game."), DIFFICULTY_LABELS[level] or level))
-        else
-            self:updateStatus()
-        end
-        self:updateDifficultyButton()
-        if menu then
-            UIManager:close(menu)
-        end
-        return true
-    end
-
-    local items = {}
-    for _, level in ipairs(DIFFICULTY_ORDER) do
-        items[#items + 1] = {
-            text = DIFFICULTY_LABELS[level] or level,
-            checked = (level == self.board.difficulty),
+-- "Create" sub-step: pick a difficulty, then generate a fresh puzzle at it.
+function SudokuScreen:openCreateMenu()
+    local dialog
+    local diff_buttons = {}
+    for _idx, level in ipairs(DIFFICULTY_ORDER) do
+        local chosen = level
+        diff_buttons[#diff_buttons + 1] = {
+            text = DIFFICULTY_LABELS[chosen] or chosen,
             callback = function()
-                return selectDifficulty(level)
+                UIManager:close(dialog)
+                self:onNewGame(chosen)
             end,
         }
     end
-
-    menu = Menu:new{
-        title = _("Select difficulty"),
-        item_table = items,
-        width = math.floor(Screen:getWidth() * 0.7),
-        height = math.floor(Screen:getHeight() * 0.9),
-        disable_footer_padding = true,
-        show_parent = self,
+    dialog = ButtonDialog:new{
+        title = _("Create: choose difficulty"),
+        title_align = "center",
+        buttons = {
+            diff_buttons,
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
     }
-    UIManager:show(menu)
+    UIManager:show(dialog)
 end
 
 function SudokuScreen:updateStatus(message)
@@ -1105,13 +1112,161 @@ function SudokuScreen:onErase()
     self:updateUndoButton()
 end
 
-function SudokuScreen:onNewGame()
-    self.board:generate(self.board.difficulty)
+function SudokuScreen:onNewGame(difficulty)
+    self.board:generate(difficulty or self.board.difficulty)
     self.plugin:saveState()
     self.board_widget:refresh()
     self:ensureShowButtonState()
     self:updateUndoButton()
-    self:updateStatus(_("Started a new game."))
+    self.note_mode = false
+    self:updateNoteButton()
+    self:updateStatus(T(_("Started a %1 game."),
+        DIFFICULTY_LABELS[self.board.difficulty] or self.board.difficulty))
+end
+
+-- "New game" first asks whether to generate a fresh puzzle or load one from a
+-- bundled/dropped-in puzzle bank.
+function SudokuScreen:onNewGamePressed()
+    local dialog
+    dialog = ButtonDialog:new{
+        title = _("New game"),
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = _("Create"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:openCreateMenu()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Load from bank"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:openLoadMenu()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function SudokuScreen:closeLoadMenus()
+    if self._load_menus then
+        for i = #self._load_menus, 1, -1 do
+            UIManager:close(self._load_menus[i])
+        end
+        self._load_menus = nil
+    end
+end
+
+function SudokuScreen:openLoadMenu()
+    local Bank = require("sudoku_bank")
+    Bank.ensurePuzzlesDir()
+    local sources = Bank.listSources()
+    if #sources == 0 then
+        UIManager:show(InfoMessage:new{
+            text = T(_("No puzzle banks found.\n\nDrop puzzle files into:\n%1"), Bank.PUZZLES_DIR),
+        })
+        return
+    end
+    local items = {}
+    for _idx, source in ipairs(sources) do
+        local entry_source = source
+        items[#items + 1] = {
+            text = T(_("%1  (%2 files)"), source.name, source.file_count),
+            callback = function()
+                self:openSourceFiles(entry_source)
+            end,
+        }
+    end
+    local menu = Menu:new{
+        title = _("Choose a puzzle bank"),
+        item_table = items,
+        width = math.floor(Screen:getWidth() * 0.8),
+        height = math.floor(Screen:getHeight() * 0.9),
+        show_parent = self,
+    }
+    self._load_menus = { menu }
+    UIManager:show(menu)
+end
+
+function SudokuScreen:openSourceFiles(source)
+    local Bank = require("sudoku_bank")
+    local files = Bank.listFiles(source)
+    local items = {
+        {
+            text = _("Random puzzle (any file)"),
+            callback = function()
+                self:loadRandomFrom(source, nil)
+            end,
+        },
+    }
+    for _, file in ipairs(files) do
+        local file_path = file.path
+        items[#items + 1] = {
+            text = file.name,
+            callback = function()
+                self:loadRandomFrom(source, file_path)
+            end,
+        }
+    end
+    local menu = Menu:new{
+        title = source.name,
+        item_table = items,
+        width = math.floor(Screen:getWidth() * 0.8),
+        height = math.floor(Screen:getHeight() * 0.9),
+        show_parent = self,
+    }
+    self._load_menus = self._load_menus or {}
+    self._load_menus[#self._load_menus + 1] = menu
+    UIManager:show(menu)
+end
+
+function SudokuScreen:loadRandomFrom(source, file_path)
+    local Bank = require("sudoku_bank")
+    local entry, err
+    if file_path then
+        entry, err = Bank.loadRandomFromFile(source, file_path)
+    else
+        entry, err = Bank.loadRandomFromSource(source)
+    end
+    if not entry then
+        UIManager:show(InfoMessage:new{ text = err or _("Could not load a puzzle.") })
+        return
+    end
+    local ok, load_err = self.board:loadPuzzle(entry.grid, {
+        solution = entry.solution,
+        label = entry.label,
+    })
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = load_err or _("This puzzle could not be loaded.") })
+        return
+    end
+    self:closeLoadMenus()
+    self.plugin:saveState()
+    self.board_widget:refresh()
+    self:ensureShowButtonState()
+    self:updateUndoButton()
+    self.note_mode = false
+    self:updateNoteButton()
+    if entry.label then
+        self:updateStatus(T(_("Loaded: %1"), entry.label))
+    else
+        self:updateStatus(_("Puzzle loaded."))
+    end
 end
 
 function SudokuScreen:toggleSolution()
